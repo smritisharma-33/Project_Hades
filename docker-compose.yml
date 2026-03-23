@@ -1,0 +1,263 @@
+version: "3.8"
+
+services:
+  # ============== Application Services ==============
+
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    container_name: hades-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}
+      - AUTH_SERVICE_URL=${AUTH_SERVICE_URL}
+      - AI_SERVICE_URL=${AI_SERVICE_URL}
+    depends_on:
+      auth:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  auth:
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    container_name: hades-auth
+    ports:
+      - "8001:8001"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}
+      - VALID_API_KEYS=${VALID_API_KEYS}
+      - VALID_TOKENS=${VALID_TOKENS}
+    depends_on:
+      otel-collector:
+        condition: service_started
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  ai-service:
+    build:
+      context: .
+      dockerfile: services/ai_service/Dockerfile
+    container_name: hades-ai-service
+    ports:
+      - "8002:8002"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}
+      - DB_SERVICE_URL=${DB_SERVICE_URL}
+      - CACHE_SERVICE_URL=${CACHE_SERVICE_URL}
+    depends_on:
+      db-service:
+        condition: service_healthy
+      cache-service:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  db-service:
+    build:
+      context: .
+      dockerfile: services/db_service/Dockerfile
+    container_name: hades-db-service
+    ports:
+      - "8003:8003"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}
+    volumes:
+      - db-data:/app/data
+    depends_on:
+      otel-collector:
+        condition: service_started
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  cache-service:
+    build:
+      context: .
+      dockerfile: services/cache_service/Dockerfile
+    container_name: hades-cache-service
+    ports:
+      - "8004:8004"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}
+      - REDIS_URL=${REDIS_URL}
+    depends_on:
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  chaos-controller:
+    build:
+      context: .
+      dockerfile: chaos/Dockerfile
+    container_name: hades-chaos
+    ports:
+      - "8005:8005"
+    environment:
+      - GATEWAY_URL=http://gateway:8000
+      - AUTH_URL=http://auth:8001
+      - AI_SERVICE_URL=http://ai-service:8002
+      - DB_SERVICE_URL=http://db-service:8003
+      - CACHE_SERVICE_URL=http://cache-service:8004
+    depends_on:
+      - gateway
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  # ============== Infrastructure ==============
+
+  redis:
+    image: redis:7-alpine
+    container_name: hades-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  # ============== Observability Stack ==============
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.96.0
+    container_name: hades-otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./observability/otel-collector/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus exporter
+    depends_on:
+      - tempo
+      - loki
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: hades-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=72h"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./observability/prometheus:/etc/prometheus
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - otel-collector
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.4.1
+    container_name: hades-tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observability/tempo/tempo-config.yaml:/etc/tempo.yaml
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo query
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:2.9.4
+    container_name: hades-loki
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/loki-config.yaml
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:2.9.4
+    container_name: hades-promtail
+    command: ["-config.file=/etc/promtail/promtail-config.yaml"]
+    volumes:
+      - ./observability/promtail/promtail-config.yaml:/etc/promtail/promtail-config.yaml
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.1
+    container_name: hades-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=${GF_USERS_ALLOW_SIGN_UP}
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hades-net
+    restart: unless-stopped
+
+networks:
+  hades-net:
+    driver: bridge
+    name: hades-net
+
+volumes:
+  db-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  tempo-data:
+  loki-data:
